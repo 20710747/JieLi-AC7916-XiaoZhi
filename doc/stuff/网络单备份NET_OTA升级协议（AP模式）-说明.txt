@@ -1,0 +1,401 @@
+//================================1、CTP命令和描述文档======================================//
+1、描述文档多加"ota_type"参数和"ota_step"参数
+ota_type值为0或者没有ota_type则为双备份
+ota_type值为1为单备份："ota_type": "1"
+
+ota_step值为0表示：单备份升级，需要先执行第一阶段
+ota_step值为1为单备份正在升级（此时需要进入第二阶段升级）："ota_step": "1"
+有ota_type则必有ota_step
+
+//"ota_type" 0 无， 1单备份
+//"ota_step" 0 可进行第一阶段的单备份升级， 1单备份正在升级第二阶段
+
+2、CTP命令，
+加一条命令："NET_OTA_SINGLE" ， 只有APP向设备请求，参数param":{"status":"1"}}
+返回参数的status参数，status:1 则设备已准备好单备份升级
+返回参数的status参数，status:0 则设备单备份升级失败
+
+//================================2、升级流程，分两个阶段======================================//
+第一阶段升级：
+（1）APP连入获取ota_type和ota_step，ota_type值为1，ota_step = 0，则可以进行单备份升级第一阶段
+（2）进入设备单备份升级，发送CTP命令：NET_OTA_SINGLE，参数：param":{"status":"1"}}
+（3）APP收到设备的"NET_OTA_SINGLE"回应NOTIFY后，status=1，则设备成功进入单备份升级模式
+（4）连接3335端口TCP，进行单备份升级，此后进入接收recv等待接收数据和读取文件
+（5）设备升级完成或升级失败：
+		socket收到数据头的status=NET_UPDATE_STATUS_ERR，或者接收超时一定次数，升级失败。
+		socket收到数据头的status=NET_UPDATE_STATUS_OK，升级成功。
+		socket收到数据头的status=NET_UPDATE_STATUS_SAME，升级的是同一个固件。
+（6）升级成功后，设备重启，APP要手动连接设备热点
+（7）如果APP主动断开则，需要往3335的socket发送NET_UPDATE_STATUS_STOP状态
+
+第二阶段升级：
+（1）APP连入3333的CTP端口，发送接入设备的ACCEPT，设备回应APP_ACCESS，带参数{"op":"NOTIFY","param":{"type":"0","ver":"20906"}}，即可进入下一步
+（2）APP连入http获取ota_type和ota_step，ota_type值为1，ota_step = 1，则可以进行单备份升级第二阶段
+（3）连接3335端口TCP，进行单备份升级，此后进入接收recv等待接收数据和读取文件
+（4）设备升级完成或升级失败：
+		socket收到数据头的status=NET_UPDATE_STATUS_ERR，或者接收超时一定次数，升级失败。
+		socket收到数据头的status=NET_UPDATE_STATUS_OK，升级成功。
+		socket收到数据头的status=NET_UPDATE_STATUS_SAME，升级的是同一个固件。
+（5）升级成功，设备重启
+（6）如果APP主动断开则，需要往3335的socket发送NET_UPDATE_STATUS_STOP状态
+
+
+第二阶段升级中，如果数据被擦了，wifi异常断开了，可以重连wifi进入继续升级（不能断电），设备断电重启之后会一直进入升级模式，
+那么重启后，则默认AP模式名字为：WIFI_OTA_XXXXXX，无密码。
+因此：注意：在第二阶段升级，禁止设备断电！！！！
+
+
+
+
+//=================================3、协议说明=================================================//
+//APP最多42K请求数据量（不可更改，设备端一定<42K）
+#define NET_BUF_MAX_SIZE    (42 * 1024)
+
+//升级端口
+#define NET_UPDATE_PORT     3335
+
+
+//status：升级状态
+#define NET_UPDATE_STATUS_DOING     (0 << 0)//设备端主动发送
+#define NET_UPDATE_STATUS_OK        (1 << 0)//设备端主动发送
+#define NET_UPDATE_STATUS_ERR       (1 << 1)//设备端主动发送
+#define NET_UPDATE_STATUS_READ      (1 << 2)//设备端主动发送
+#define NET_UPDATE_STATUS_STOP      (1 << 3)//APP主动的停止升级
+#define NET_UPDATE_STATUS_SAME      (1 << 4)//升级的是同一个固件
+
+
+//协议：头部20字节
+struct net_ota{
+    unsigned int sum_check;//设备端：头部16字节和校验，APP端：头部16字节+读取字节的和校验，（sum_check不加上和校验计算）
+	unsigned int seek_addr;//文件偏移地址
+	unsigned int read_size;//读取文件长度
+    unsigned int all_size;//升级过程中需要的文件总字节数（用在进度条），整个升级过程中会有一次的all_size > 0, 其他次all_size = 0
+    unsigned int status:8;//升级状态，NET_UPDATE_STATUS_NONE正在升级，NET_UPDATE_STATUS_OK升级成功，NET_UPDATE_STATUS_ERR升级失败
+	unsigned int download_percent:8;//升级过程中设备的百分比
+	unsigned int resv:16;//预留，最后收到这4个字节代表成功和失败
+	unsigned char buf[0];
+};
+
+//发送数据流程：可以一次性发送：协议头+数据， 或者先发头部再发数据（数据的和校验要进行计算）
+//（1）设备项APP请求：发送协议，只有数据头，长度为sizeof(struct net_ota);
+//（2）APP响应设备请求：发送协议，有数据头+数据，长度为sizeof(struct net_ota)+数据长度;
+
+注意：协议中，除了头部的sum_check没有加上和校验，其他和数据都需要进行和校验计算，详情下面的：windows socket测试代码。
+
+//===================================4、APP端的windows socket测试代码====================================================//
+//（注意：该测试程序在windows测试，设备wifi启动后执行net_ota_single_back_init()，如在wifi_app_task.c的net_app_init函数，则就不需要发命令NET_OTA_SINGLE即可进入运行改程序测试）
+#include <stdio.h>
+#include <stdlib.h>
+#include <winsock2.h>
+
+//第一阶段需要：先连接CTP 3333端口，发送NET_OTA_SINGLE命令进入升级模式
+//第二阶段需要：先连接CTP 3333端口，再连接HTTP 8080端口，再连接升级3335端口
+
+//#define NET_UPDATE_PORT      3333                //CTP端口号
+//#define NET_UPDATE_PORT     8080                //HTTP端口号
+#define NET_UPDATE_PORT     3335                //网络升级端口号
+
+
+
+#define CTP_VER "{\"op\":\"NOTIFY\",\"param\":{\"type\":\"0\",\"ver\":\"20906\"}}"
+
+
+
+#define NET_SERVER_IP       "192.168.1.1"       //IP地址
+#define NET_BUF_MAX_SIZE    (42 * 1024)         //设备端最多42K请求数据量（不可更改，设备端一定<42K）
+#define NET_UPDATE_FILE     "E:\\update.ufw"    //升级文件路径
+
+#define NET_UPDATE_STATUS_DOING     (0 << 0)//设备端主动发送
+#define NET_UPDATE_STATUS_OK        (1 << 0)//设备端主动发送
+#define NET_UPDATE_STATUS_ERR       (1 << 1)//设备端主动发送
+#define NET_UPDATE_STATUS_READ      (1 << 2)//设备端主动发送
+#define NET_UPDATE_STATUS_STOP      (1 << 3)//APP主动的停止升级
+#define NET_UPDATE_STATUS_SAME      (1 << 4)//升级的是同一个固件
+
+
+
+static int sk_fd = 0;
+static FILE *fd;
+static int file_size = 0;
+
+//协议
+struct net_ota{
+    unsigned int sum_check;//设备端：头部16字节和校验，APP端：头部16字节+读取字节的和校验，（sum_check不加上和校验计算）
+	unsigned int seek_addr;//文件偏移地址
+	unsigned int read_size;//读取文件长度
+    unsigned int all_size;//升级过程中需要的文件总字节数（用在进度条），整个升级过程中会有一次的all_size > 0, 其他次all_size = 0
+    unsigned int status:8;//升级状态，NET_UPDATE_STATUS_NONE正在升级，NET_UPDATE_STATUS_OK升级成功，NET_UPDATE_STATUS_ERR升级失败
+    unsigned int download_percent:8;//升级过程中设备的百分比
+	unsigned int resv:16;//预留
+	unsigned char buf[0];
+};
+unsigned int sumget(void *buf, int len)
+{
+    unsigned char *pbuf = (unsigned char *)buf;
+    unsigned int sum = 0;
+    int i = 0;
+    while(i < len){
+        sum += pbuf[i++];
+    }
+    return sum;
+}
+int sumcheck(void *buf, int len, unsigned int sum)
+{
+    unsigned char *pbuf = (unsigned char *)buf;
+    unsigned int sum_check = 0;
+    int i = 0;
+    while(i < len){
+        sum_check += pbuf[i++];
+    }
+    if(sum_check != sum){
+        printf("err sumcheck = 0x%x, 0x%x\n",sum_check,sum);
+        return -1;
+    }
+    return 0;
+}
+int socket_init(void)
+{
+    int err;
+	int send_to_millsec = 5000;
+	int recv_to_millsec = 5000;//5s超时
+   	int len;
+   	struct sockaddr_in serv_addr = {0};
+
+   	fd = fopen(NET_UPDATE_FILE, "rb");
+    if(!fd){
+        printf("err in open file \r\n");
+        return -1;
+    }
+    fseek(fd, 0, SEEK_END);
+    file_size = ftell(fd);
+    fseek(fd, 0, SEEK_SET);
+
+    /* 3 . socket */
+    sk_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if(sk_fd < 0)
+    {
+        printf("  . ! socket error !!!\r\n");
+        return -1;
+    }
+    setsockopt(sk_fd, SOL_SOCKET, SO_RCVTIMEO, (const void *)&recv_to_millsec, sizeof(recv_to_millsec));
+    setsockopt(sk_fd, SOL_SOCKET, SO_SNDTIMEO, (const void *)&send_to_millsec, sizeof(send_to_millsec));
+
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(NET_UPDATE_PORT);//指定服务器端口
+    serv_addr.sin_addr.s_addr = inet_addr(NET_SERVER_IP);//指定服务器IP
+    printf("  . server ip : %s  port : %d \r\n",NET_SERVER_IP,NET_UPDATE_PORT);
+
+
+    /* 4 . connect */
+    for (int i = 0; i <= 3; i++)
+    {
+        err = connect(sk_fd, (struct sockaddr *)&serv_addr, sizeof(struct sockaddr_in));
+        if (!err) {
+            break;
+        }
+        if (err < 0 && i >= 3) {
+            printf("  . ! connect error !!!\r\n");
+            shutdown(sk_fd,2);
+            closesocket(sk_fd);
+            return  -1;
+        }
+        printf("  . Retry to connect ~~~\r\n");
+    }
+    printf("  . connect server ok \r\n");
+	return 0;
+}
+int socket_send_stop(struct net_ota *net_ota_data)
+{
+    //生成发送数据头部和数据的和校验
+    net_ota_data->seek_addr = 0;
+    net_ota_data->read_size = 0;
+    net_ota_data->all_size = 0;
+    net_ota_data->seek_addr = 0;
+    net_ota_data->status = NET_UPDATE_STATUS_STOP;
+    net_ota_data->sum_check = sumget((char*)net_ota_data + sizeof(net_ota_data->sum_check), sizeof(struct net_ota) - sizeof(net_ota_data->sum_check));
+    //发送数据
+    return send(sk_fd, net_ota_data, sizeof(struct net_ota), 0);
+}
+int socket_send(struct net_ota *net_ota_data, void *buf, int len)
+{
+    //生成发送数据头部和数据的和校验
+    net_ota_data->seek_addr = 0;
+    net_ota_data->read_size = 0;
+    net_ota_data->all_size = 0;
+    net_ota_data->seek_addr = 0;
+    net_ota_data->status = 0;
+    net_ota_data->sum_check = sumget((char*)net_ota_data + sizeof(net_ota_data->sum_check), sizeof(struct net_ota) - sizeof(net_ota_data->sum_check));
+    //发送数据
+    return send(sk_fd, net_ota_data, sizeof(struct net_ota), 0);
+}
+int socket_loop(void)
+{
+    int err = 0;
+    int cnt = 0;
+    int slen;
+    int len;
+    int net_file_all_size = 0;
+
+    //申请缓存
+    struct net_ota *net_ota_data = malloc(sizeof(struct net_ota) + NET_BUF_MAX_SIZE);
+    if(!net_ota_data){
+        return -1;
+    }
+    //初始化socket连接服务器
+    if(socket_init()){
+         return -1;
+    }
+    if(NET_UPDATE_PORT == 8080){//http协议发送http请求，测试模式APP的http
+        socket_send_stop(net_ota_data);
+        len = recv(sk_fd, net_ota_data->buf, 4096, 0);
+        if(len){
+            printf("---> http recv : %s \n",net_ota_data->buf);
+        }
+        goto exit;
+    }
+    if(NET_UPDATE_PORT == 3333){//CTP协议发送，测试模式APP的CTP命令
+        send(sk_fd, CTP_VER, strlen(CTP_VER), 0);
+        len = recv(sk_fd, net_ota_data->buf, 4096, 0);
+        if(len){
+            printf("---> ctp recv : %s \n",net_ota_data->buf + 0x14);
+        }
+        goto exit;
+    }
+
+    //socket读写
+    while(1){
+        //先读取协议头部字节
+        memset(net_ota_data, 0, sizeof(struct net_ota));
+        len = recv(sk_fd, net_ota_data, sizeof(struct net_ota), 0);
+        if(len < 0){
+            cnt++;
+            if(cnt > 10){
+                printf("err recv timeout \n");
+                 err = -1;
+                break;
+            }
+            continue;
+        }else if(!len){
+            printf("err : server disconneted !\n");
+            err = -1;
+            break;
+        }
+        cnt = 0;
+
+        //对头部进行和校验，和校验出错则继续接收头部信息
+        if(sumcheck((char*)net_ota_data + sizeof(net_ota_data->sum_check), sizeof(struct net_ota) - sizeof(net_ota_data->sum_check), net_ota_data->sum_check)){
+            continue;
+        }
+
+        if(net_ota_data->status == NET_UPDATE_STATUS_OK){//升级完成状态，才显示100%，提示升级成功
+            printf("net update complet >>> 100%% \r\n");
+            printf("net update ok \r\n");
+            break;
+        }else if(net_ota_data->status == NET_UPDATE_STATUS_ERR){//升级出错状态
+            printf("net update err \r\n");
+             err = -1;
+            break;
+        }else if(net_ota_data->status == NET_UPDATE_STATUS_SAME){//升级同一个固件，没有必要升级
+            printf("net update all same \r\n");
+            break;
+        }else if(net_ota_data->status != NET_UPDATE_STATUS_READ){//不是读取则继续
+            //读取请求的总长度
+            if(net_ota_data->all_size){//all_size为本次升级的总字节数，不需要读文件操作
+                net_file_all_size = net_ota_data->all_size;//收到all_size，代表设备已不可恢复
+            }
+            continue;
+        }
+
+        //收到read为0，或者状态不是读取 说明设备异常，终止升级
+        if(!net_ota_data->read_size){
+            printf("net update read_size err\r\n");
+            err = -1;
+            break;
+        }
+        printf("---> update  %d%%\n",net_ota_data->download_percent);
+        if(fd){
+            //偏移文件地址，并读取对应字节数
+            if(net_ota_data->seek_addr){
+                fseek(fd, net_ota_data->seek_addr, SEEK_SET);
+                if((net_ota_data->seek_addr + net_ota_data->read_size) > file_size){//检测读取超件大小
+                    net_ota_data->read_size = file_size - net_ota_data->seek_addr;
+                }
+            }else{
+                if((ftell(fd) + net_ota_data->read_size) > file_size){//检测读取超文件大小
+                    net_ota_data->read_size = file_size - net_ota_data->seek_addr;
+                }
+            }
+            len = fread(net_ota_data->buf, 1, net_ota_data->read_size, fd);
+            if(len == net_ota_data->read_size){
+                //生成发送数据头部和数据的和校验
+                net_ota_data->sum_check = sumget((char*)net_ota_data + sizeof(net_ota_data->sum_check), net_ota_data->read_size + sizeof(struct net_ota) - sizeof(net_ota_data->sum_check));
+                slen = net_ota_data->read_size + sizeof(struct net_ota);
+                //发送数据
+                len = send(sk_fd, net_ota_data, slen, 0);
+                if(len != slen){//socket出错
+                    printf("net send err = %d!!!\n",len);
+                    err = -1;
+                    break;
+                }
+            }else{//文件出错
+                memset(net_ota_data, 0, sizeof(struct net_ota));//读文件出错，发送读字节为0给服务器
+                send(sk_fd, net_ota_data, sizeof(struct net_ota), 0);
+                err = -1;
+                printf("fread err !!!\n");
+                break;
+            }
+        }
+    }
+
+    if(err){
+        socket_send_stop(net_ota_data);
+        if(net_file_all_size){//收到all_size，代表设备已不可恢复，此时APP提示：可以重连wifi重新升级
+            printf("please connet WIFI_OTA_XXXX to do again \r\n");
+        }else{//没有收到all_size，则设备可以恢复原来
+            printf("please reset device to do again \r\n");
+        }
+    }
+    if(net_ota_data){
+        free(net_ota_data);
+        net_ota_data = NULL;
+    }
+    if(fd){
+        fclose(fd);
+        fd = 0;
+    }
+exit:
+    if(sk_fd){
+        shutdown(sk_fd,2);
+        closesocket(sk_fd);
+        sk_fd = 0;
+    }
+    printf("======= close socket =======\n");
+    return err;
+}
+
+
+int main()
+{
+    int index=0;
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2,2),&wsa);
+    socket_loop();
+    while(1){
+        Sleep(1000);
+    }
+    WSACleanup();
+    return 0;
+}
+
+
+//===================================5、设备端开发====================================================//
+设备端程序：net_single_backup_update.c
+1、app_config.c开启：CONFIG_DOUBLE_BANK_ENABLE 为 0，可支持单备份wifi网络升级
+2、在接收到"NET_OTA_SINGLE"后，设备执行：net_ota_single_back_init()，建立3335端口的TCP监听，等待APP连接 
+  （这个步骤在windows测试则，可以直接在设备wifi启动后执行net_ota_single_back_init()，比如在wifi_app_task.c的net_app_init函数，则就不需要发命令进入）。
+3、在请求升级文件数据，设备的第一阶段升级文件读取是从文件前往后读取（但在第二阶段的ota.bin的net_ota.bin是从文件后往前读取，一般客户忽略此说明），
+   设备的应用层程序net_single_backup_update.c的NET_OTA_FILE_RESV宏控制。
+4、在设备第一阶段升级完成后，会把VM地址和VM长度传进第二阶段使用wifi信息，详情：update.c的update_mode_api_v2函数的vm_reverse_addr_size_get()。
+5、设备第一阶段升级后需要断开所有wifi，函数wifi_all_sta_discon()，否则重启后有些手机或者其他设备没有断开，tcp无法通信。
+6、如在第二阶段，APP无法连接，则需要重启APP。
+

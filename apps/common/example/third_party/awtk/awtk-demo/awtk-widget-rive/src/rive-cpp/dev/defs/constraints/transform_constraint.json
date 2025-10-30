@@ -1,0 +1,8 @@
+{
+  "name": "TransformConstraint",
+  "key": {
+    "int": 83,
+    "string": "transformconstraint"
+  },
+  "extends": "constraints/transform_space_constraint.json"
+}
