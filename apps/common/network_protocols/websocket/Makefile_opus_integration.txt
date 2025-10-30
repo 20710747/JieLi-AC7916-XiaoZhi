@@ -1,0 +1,105 @@
+# Makefile修改建议 - 集成Opus音频播放功能
+
+## 需要添加到Makefile的内容
+
+### 1. 添加源文件到编译列表
+
+在相应的Makefile中添加：
+
+```makefile
+# WebSocket Opus音频播放相关文件
+objs += \
+    $(src)/apps/common/network_protocols/websocket/xz_main.o \
+    $(src)/apps/common/network_protocols/websocket/opus_decoder_wrapper.o
+```
+
+### 2. 添加头文件搜索路径
+
+```makefile
+# 添加opus相关的头文件路径
+INCLUDES += \
+    -I$(src)/apps/common/network_protocols/websocket \
+    -I$(src)/apps/common/audio_music \
+    -I$(src)/include_lib/server \
+    -I$(src)/include_lib/media
+```
+
+### 3. 添加libopus库链接（如果使用标准libopus）
+
+```makefile
+# 如果使用标准libopus库
+LIBS += -lopus
+
+# 或者指定库文件路径
+LIBS += $(src)/lib/libopus.a
+```
+
+### 4. 添加编译选项（可选）
+
+```makefile
+# 如果要使用libopus，添加此定义
+CFLAGS += -DUSE_LIBOPUS
+
+# 优化选项
+CFLAGS += -O2
+```
+
+## 完整示例
+
+假设您的项目Makefile位于 apps/common/network_protocols/Makefile：
+
+```makefile
+# ... 现有的配置 ...
+
+# 添加源文件
+objs += \
+    websocket/xz_main.o \
+    websocket/opus_decoder_wrapper.o \
+    websocket/json_tools.o
+
+# 添加头文件路径
+INCLUDES += \
+    -I$(src)/apps/common/network_protocols/websocket \
+    -I$(src)/apps/common/audio_music \
+    -I$(src)/include_lib/server \
+    -I$(src)/include_lib/media \
+    -I$(src)/include_lib/system
+
+# 如果使用标准libopus
+# CFLAGS += -DUSE_LIBOPUS
+# LIBS += -lopus
+
+# ... 其他配置 ...
+```
+
+## 注意事项
+
+1. **路径调整**: 根据实际项目结构调整相对路径
+2. **库文件位置**: 确保libopus.a在正确的位置
+3. **交叉编译**: 确保libopus是为AC7916平台编译的
+4. **依赖检查**: 运行 `make clean` 后重新编译
+
+## 编译测试
+
+```bash
+# 清理旧的编译文件
+make clean
+
+# 编译项目
+make
+
+# 检查是否有链接错误
+# 如果提示找不到opus相关符号，说明需要链接libopus库
+```
+
+## 使用SDK内置的opus解码器（替代方案）
+
+如果不想集成外部libopus，可以使用SDK内置的opus解码器：
+
+```makefile
+# 链接SDK内置的opus解码库
+LIBS += $(src)/cpu/wl82/liba/lib_opus_dec.a
+```
+
+这种方式不需要修改 opus_decoder_wrapper.c 中的 USE_LIBOPUS 宏。
+

@@ -5,6 +5,8 @@
 #include "json_tools.h"  // 添加JSON工具头文件
 #include "robot_cmd.h"   // 添加robot命令头文件
 #include "xz_main.h"
+#include "pcm_play_api.h" // 添加PCM播放API头文件
+#include "opus_decoder_wrapper.h" // 添加Opus解码器包装头文件
 #define USE_WEBSOCKET_TEST
 
 #ifdef WEBSOCKET_MEMHEAP_DEBUG
@@ -26,42 +28,204 @@ bool g_session_id_received = false;
 // 全局WebSocket实例
 static struct websocket_struct *g_websockets_info = NULL;
 
+// 音频播放相关全局变量
+static void *g_pcm_player = NULL;  // PCM播放器句柄
+static bool g_audio_playing = false;  // 音频播放状态标志
+static opus_decoder_handle_t g_opus_decoder = NULL;  // Opus解码器句柄
+
+// Opus音频参数（根据协议定义）
+#define OPUS_SAMPLE_RATE    16000
+#define OPUS_CHANNELS       1
+#define OPUS_FRAME_DURATION 60
+#define OPUS_FRAME_SIZE     (OPUS_SAMPLE_RATE * OPUS_FRAME_DURATION / 1000)  // 960 samples
+#define PCM_BUFFER_SIZE     (OPUS_FRAME_SIZE * 2 * OPUS_CHANNELS)  // 每帧PCM数据大小（字节）
+
+// 音频播放器初始化
+static int audio_player_init(void)
+{
+    if (g_pcm_player != NULL && g_opus_decoder != NULL) {
+        DBG_PRINTF("Audio player already initialized\n");
+        return 0;
+    }
+
+    // 初始化Opus解码器
+    if (g_opus_decoder == NULL) {
+        g_opus_decoder = opus_decoder_wrapper_init(OPUS_SAMPLE_RATE, OPUS_CHANNELS);
+        if (g_opus_decoder == NULL) {
+            DBG_PRINTF("Failed to initialize opus decoder\n");
+            return -1;
+        }
+        DBG_PRINTF("Opus decoder initialized\n");
+    }
+
+    // 打开PCM播放器
+    // 参数：采样率、帧大小、丢弃点数、声道数、音量、阻塞模式
+    if (g_pcm_player == NULL) {
+        g_pcm_player = audio_pcm_play_open(
+            OPUS_SAMPLE_RATE,    // 采样率 16000Hz
+            PCM_BUFFER_SIZE * 4, // 帧缓冲大小
+            0,                   // 丢弃点数
+            OPUS_CHANNELS,       // 声道数 1
+            80,                  // 音量 0-100
+            0                    // 非阻塞模式
+        );
+
+        if (g_pcm_player == NULL) {
+            DBG_PRINTF("Failed to open PCM player\n");
+            opus_decoder_wrapper_destroy(g_opus_decoder);
+            g_opus_decoder = NULL;
+            return -1;
+        }
+
+        // 启动播放器
+        if (audio_pcm_play_start(g_pcm_player) != 0) {
+            DBG_PRINTF("Failed to start PCM player\n");
+            audio_pcm_play_stop(g_pcm_player);
+            g_pcm_player = NULL;
+            opus_decoder_wrapper_destroy(g_opus_decoder);
+            g_opus_decoder = NULL;
+            return -1;
+        }
+    }
+
+    g_audio_playing = true;
+    DBG_PRINTF("Audio player initialized successfully\n");
+    return 0;
+}
+
+// 音频播放器停止
+static void audio_player_stop(void)
+{
+    if (g_pcm_player != NULL) {
+        audio_pcm_play_stop(g_pcm_player);
+        g_pcm_player = NULL;
+    }
+    
+    if (g_opus_decoder != NULL) {
+        opus_decoder_wrapper_destroy(g_opus_decoder);
+        g_opus_decoder = NULL;
+    }
+    
+    g_audio_playing = false;
+    DBG_PRINTF("Audio player stopped\n");
+}
+
+// 播放PCM数据
+static int audio_play_pcm_data(u8 *pcm_data, u32 size)
+{
+    if (g_pcm_player == NULL) {
+        DBG_PRINTF("PCM player not initialized\n");
+        return -1;
+    }
+
+    int ret = audio_pcm_play_data_write(g_pcm_player, pcm_data, size);
+    if (ret < 0) {
+        DBG_PRINTF("Failed to write PCM data\n");
+        return -1;
+    }
+
+    return 0;
+}
 
 static void websockets_callback(u8 *buf, u32 len, u8 type)
 {
-    DBG_PRINTF("wbs recv msg : %s\n", buf);
-    DBG_PRINTF("wbs recv type : %u\n", type);
-    // 解析收到的JSON消息
-    websocket_message_t message;
-    if (parse_websocket_message((char*)buf, &message)) {
-        DBG_PRINTF("Received JSON message type: %s\n", message_type_to_string(message.type));
+    DBG_PRINTF("wbs recv type: %u, len: %u\n", type, len);
 
-        // 根据消息类型处理
-        switch (message.type) {
-            case MSG_TYPE_HELLO:
-                DBG_PRINTF("Hello message received, version: %d\n", message.version);
-                // 保存session_id
-                if (strlen(message.session_id) > 0) {
-                    strncpy(g_session_id, message.session_id, sizeof(g_session_id) - 1);
-                    g_session_id_received = true;
-                    DBG_PRINTF("Session ID saved: %s\n", g_session_id);
-                }
-                break;
-            case MSG_TYPE_STT:
-                DBG_PRINTF("STT text: %s\n", message.data.stt.text);
-                break;
-            case MSG_TYPE_TTS:
-                DBG_PRINTF("TTS state: %d, text: %s\n", message.data.tts.state, message.data.tts.text);
-                break;
-            case MSG_TYPE_LISTEN:
-                DBG_PRINTF("Listen state: %d, mode: %d\n", message.data.listen.state, message.data.listen.mode);
-                break;
-            default:
-                DBG_PRINTF("Unhandled message type\n");
-                break;
+    // type = 129 (0x81): JSON文本数据
+    // type = 130 (0x82): 二进制Opus数据
+    if (type == 129) {
+        // 处理JSON消息
+        DBG_PRINTF("wbs recv JSON msg: %s\n", buf);
+        websocket_message_t message;
+        if (parse_websocket_message((char*)buf, &message)) {
+            DBG_PRINTF("Received JSON message type: %s\n", message_type_to_string(message.type));
+
+            // 根据消息类型处理
+            switch (message.type) {
+                case MSG_TYPE_HELLO:
+                    DBG_PRINTF("Hello message received, version: %d\n", message.version);
+                    // 保存session_id
+                    if (strlen(message.session_id) > 0) {
+                        strncpy(g_session_id, message.session_id, sizeof(g_session_id) - 1);
+                        g_session_id_received = true;
+                        DBG_PRINTF("Session ID saved: %s\n", g_session_id);
+                    }
+                    break;
+                case MSG_TYPE_STT:
+                    DBG_PRINTF("STT text: %s\n", message.data.stt.text);
+                    break;
+                case MSG_TYPE_TTS:
+                    DBG_PRINTF("TTS state: %d, text: %s\n", message.data.tts.state, message.data.tts.text);
+                    
+                    // TTS开始时初始化音频播放器
+                    if (message.data.tts.state == TTS_STATE_START) {
+                        if (audio_player_init() == 0) {
+                            DBG_PRINTF("Audio player initialized for TTS playback\n");
+                        }
+                    }
+                    // TTS结束时停止音频播放器
+                    else if (message.data.tts.state == TTS_STATE_END) {
+                        audio_player_stop();
+                        DBG_PRINTF("Audio player stopped after TTS end\n");
+                    }
+                    break;
+                case MSG_TYPE_LISTEN:
+                    DBG_PRINTF("Listen state: %d, mode: %d\n", message.data.listen.state, message.data.listen.mode);
+                    break;
+                default:
+                    DBG_PRINTF("Unhandled message type\n");
+                    break;
+            }
+
+            free_websocket_message(&message);
+        }
+    }
+    else if (type == 130) {
+        // 处理二进制Opus音频数据
+        DBG_PRINTF("Received Opus audio data, len: %u\n", len);
+        
+        // 确保音频播放器已初始化
+        if (!g_audio_playing) {
+            DBG_PRINTF("Audio player not ready, initializing...\n");
+            if (audio_player_init() != 0) {
+                DBG_PRINTF("Failed to initialize audio player\n");
+                return;
+            }
         }
 
-        free_websocket_message(&message);
+        // 解码Opus数据为PCM
+        if (g_opus_decoder != NULL) {
+            // 分配PCM输出缓冲区
+            s16 pcm_output[OPUS_FRAME_SIZE * OPUS_CHANNELS];
+            
+            // 调用opus解码器
+            int decoded_samples = opus_decoder_wrapper_decode(
+                g_opus_decoder, 
+                buf, 
+                len, 
+                pcm_output, 
+                OPUS_FRAME_SIZE
+            );
+            
+            if (decoded_samples > 0) {
+                // 计算PCM数据字节数（采样点数 * 2字节/采样点 * 声道数）
+                u32 pcm_size = decoded_samples * 2 * OPUS_CHANNELS;
+                
+                // 播放解码后的PCM数据
+                if (audio_play_pcm_data((u8*)pcm_output, pcm_size) == 0) {
+                    DBG_PRINTF("Played PCM data: %d samples, %d bytes\n", decoded_samples, pcm_size);
+                } else {
+                    DBG_PRINTF("Failed to play PCM data\n");
+                }
+            } else {
+                DBG_PRINTF("Failed to decode opus data: %d\n", decoded_samples);
+            }
+        } else {
+            DBG_PRINTF("Opus decoder not initialized\n");
+        }
+    }
+    else {
+        DBG_PRINTF("Unknown data type: %u\n", type);
     }
 }
 
