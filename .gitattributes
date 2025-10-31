@@ -1,0 +1,27 @@
+# 对所有文本文件自动处理换行符
+* text=auto
+
+# 明确指定某些文件类型为文本文件
+*.txt text
+*.java text
+*.js text
+*.html text
+*.css text
+*.md text
+*.json text
+*.xml text
+
+# 明确指定二进制文件，避免转换
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+
+# 对于 Windows 批处理文件，保持 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 对于 Shell 脚本，保持 LF
+*.sh text eol=lf
